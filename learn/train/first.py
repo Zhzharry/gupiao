@@ -26,11 +26,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
-try:
-    import ta  # 技术指标库
-except ImportError:
-    print("警告: ta库未安装，将使用简单技术指标")
-    ta = None
+import ta  # 技术指标库
 from datetime import datetime, timedelta
 import warnings
 import os
@@ -538,23 +534,25 @@ def main():
     print("🎯 股票价格预测模型训练程序")
     print("=" * 60)
     
+    # 检查GPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"当前使用设备: {device}")
+    
     # 优化后的配置
     config = {
         # 输入序列参数
-        'seq_length': 60,           # 扩大历史窗口（捕获更长依赖）
+        'seq_length': 120,           # 更长历史窗口（捕获更长依赖）
         'prediction_days': 7,        # 支持多步预测
-        
         # 模型结构参数（核心调整）
-        'd_model': 256,              # 原128→256（提升特征表达能力）
-        'nhead': 8,                  # 保持与d_model兼容（256/8=32）
-        'num_layers': 4,             # 原3→4（加深网络但避免过深）
-        'dropout': 0.15,             # 原0.1→0.15（适度正则化）
-        
+        'd_model': 512,              # 更大模型容量
+        'nhead': 8,                  # 注意力头数（512/8=64）
+        'num_layers': 8,             # 更深网络
+        'dropout': 0.2,              # 增加正则
         # 训练参数（适配扩大后的模型）
-        'batch_size': 64,            # 原32→64（提升并行效率）
-        'learning_rate': 5e-4,       # 原1e-3→5e-4（平衡速度和稳定性）
-        'epochs': 150,               # 延长训练时间
-        'weight_decay': 1e-5,        # 更小的L2约束（避免限制大模型）
+        'batch_size': 128,           # 更大批量
+        'learning_rate': 2e-4,       # 稍低学习率
+        'epochs': 300,               # 更长训练
+        'weight_decay': 5e-5,        # 适度L2正则
     }
     
     print("📋 配置参数:")
@@ -565,11 +563,12 @@ def main():
     # 创建训练器
     print("🏗️  正在创建训练器...")
     trainer = ImprovedStockTrainer(config)
+    trainer.device = device  # 强制训练器使用检测到的设备
     print("✅ 训练器创建完成")
     
     # 加载训练数据
-    print("\n📊 正在加载训练数据...")
-    train_data_dir = "../../data/learn_csv"
+    train_data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/learn_csv'))
+    print("训练数据目录绝对路径:", train_data_dir)
     
     if not os.path.exists(train_data_dir):
         print(f"❌ 训练数据目录不存在: {train_data_dir}")

@@ -37,6 +37,7 @@ import math  # 数学函数
 import numpy as np  # 数值计算库
 
 class PositionalEncoding(nn.Module):
+    pe: torch.Tensor  # 类型注解，修复类型检查报错
     """位置编码模块，为Transformer提供序列位置信息"""
     
     def __init__(self, d_model, max_len=5000):
@@ -314,6 +315,9 @@ class LSTMTransformer(nn.Module):
             dropout=dropout,  # Dropout率
             batch_first=True  # 批次维度在前
         )
+        
+        # 输入投影层（将输入特征映射到模型维度）
+        self.input_projection = nn.Linear(input_dim, d_model)
         
         # 位置编码
         self.pos_encoder = PositionalEncoding(d_model)
