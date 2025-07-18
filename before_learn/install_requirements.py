@@ -2,6 +2,14 @@
 股票价格预测模型 - 依赖安装工具
 ================================
 
+【pandas库说明】
+如果你在运行过程中遇到如下报错：
+Traceback (most recent call last):
+  File "/root/miniconda3/learn_transformer/learn/learn/train/first.py", line 2, in <module>
+    import pandas as pd
+ModuleNotFoundError: No module named 'pandas'
+请直接运行本脚本（python install_requirements.py），即可自动安装pandas库。
+
 文件作用：
 - 自动安装项目所需的Python依赖包
 - 检查系统环境和依赖版本
@@ -16,9 +24,9 @@
 5. 环境验证：验证安装后的环境状态
 
 安装的依赖包：
+- pandas：数据处理核心库（必须）
 - PyTorch：深度学习框架
 - NumPy：数值计算库
-- Pandas：数据处理库
 - Scikit-learn：机器学习库
 - Matplotlib：绘图库
 - 其他必要的科学计算库
@@ -41,16 +49,17 @@ import importlib
 import subprocess
 import sys
 
-# 需要的库及其pip包名
+# 需要的库及其pip包名（pandas放首位，必须）
 required_packages = {
+    "pandas": "pandas",   # 必须的核心数据处理库
     "torch": "torch",
     "numpy": "numpy",
-    "pandas": "pandas",
     "matplotlib": "matplotlib",
     "sklearn": "scikit-learn",
     "yfinance": "yfinance",
     "transformers": "transformers",
-    "ta": "ta"  # 技术分析库
+    "ta": "ta",  # 技术分析库
+    "seaborn": "seaborn"  # 可视化库
 }
 
 def install_if_missing(module_name, pip_name):
@@ -62,6 +71,7 @@ def install_if_missing(module_name, pip_name):
         subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
 
 if __name__ == "__main__":
+    print("【重要】本项目依赖 pandas 进行数据处理，如遇到 'No module named pandas'，请确保本脚本能正常运行。")
     for module, pip_name in required_packages.items():
         install_if_missing(module, pip_name)
     print("所有依赖库已检查并安装完毕。")

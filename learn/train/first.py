@@ -1,634 +1,561 @@
-"""
-股票价格预测模型调优方案
-========================
-
-针对50%准确率问题的全面优化方案，包括：
-1. 数据质量改进
-2. 特征工程优化
-3. 模型架构调整
-4. 训练策略改进
-5. 评估指标优化
-
-主要改进点：
-- 更好的数据预处理和特征工程
-- 改进的损失函数（方向预测+价格预测）
-- 更合理的模型架构
-- 更好的训练策略
-- 更全面的评估指标
-"""
-
+import os
+import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
-import ta  # 技术指标库
+import seaborn as sns
 from datetime import datetime, timedelta
 import warnings
-import os
-import pickle
+import math
+from tqdm import tqdm
+import json
+
 warnings.filterwarnings('ignore')
 
-class ImprovedStockDataProcessor:
-    """改进的数据处理器"""
+class StockDataset(Dataset):
+    """股票数据集类"""
+    def __init__(self, data, sequence_length=30, target_column='close'):
+        self.data = data
+        self.sequence_length = sequence_length
+        self.target_column = target_column
+        self.feature_columns = ['open', 'high', 'low', 'close', 'vol', 'amount']
+        
+        # 准备特征和目标数据
+        self.prepare_data()
     
-    def __init__(self, seq_length=30, prediction_days=1):
-        self.seq_length = seq_length
-        self.prediction_days = prediction_days
-        self.feature_scaler = RobustScaler()  # 使用RobustScaler，对异常值更稳健
-        self.target_scaler = StandardScaler()
-        self.feature_columns = []
-        
-    def add_advanced_features(self, df):
-        """添加高级特征工程"""
-        df = df.copy()
-        
-        # 基础价格特征
-        df['return_1d'] = df['close'].pct_change()
-        df['return_5d'] = df['close'].pct_change(5)
-        df['return_10d'] = df['close'].pct_change(10)
-        
-        # 价格位置特征
-        df['price_position_5d'] = (df['close'] - df['close'].rolling(5).min()) / (df['close'].rolling(5).max() - df['close'].rolling(5).min())
-        df['price_position_20d'] = (df['close'] - df['close'].rolling(20).min()) / (df['close'].rolling(20).max() - df['close'].rolling(20).min())
-        
-        # 波动率特征
-        df['volatility_5d'] = df['return_1d'].rolling(5).std()
-        df['volatility_20d'] = df['return_1d'].rolling(20).std()
-        
-        # 成交量特征
-        df['volume_ma_5'] = df['vol'].rolling(5).mean()
-        df['volume_ma_20'] = df['vol'].rolling(20).mean()
-        df['volume_ratio'] = df['vol'] / df['volume_ma_20']
-        
-        # 价格突破特征
-        df['breakout_up'] = (df['close'] > df['close'].rolling(20).max().shift(1)).astype(int)
-        df['breakout_down'] = (df['close'] < df['close'].rolling(20).min().shift(1)).astype(int)
-        
-        # 技术指标 - 使用简单计算方法
-        # RSI计算
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # MACD计算
-        ema12 = df['close'].ewm(span=12).mean()
-        ema26 = df['close'].ewm(span=26).mean()
-        df['macd'] = ema12 - ema26
-        df['macd_signal'] = df['macd'].ewm(span=9).mean()
-        
-        # 布林带计算
-        sma20 = df['close'].rolling(window=20).mean()
-        std20 = df['close'].rolling(window=20).std()
-        df['bb_upper'] = sma20 + (std20 * 2)
-        df['bb_lower'] = sma20 - (std20 * 2)
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['close']
-        
-        # 移动平均线
-        df['sma_5'] = df['close'].rolling(5).mean()
-        df['sma_20'] = df['close'].rolling(20).mean()
-        df['ema_12'] = df['close'].ewm(span=12).mean()
-        df['ema_26'] = df['close'].ewm(span=26).mean()
-        
-        # 趋势特征
-        df['trend_5d'] = (df['close'] > df['sma_5']).astype(int)
-        df['trend_20d'] = (df['close'] > df['sma_20']).astype(int)
-        
-        # 市场状态特征
-        df['market_cap'] = df['close'] * df['vol']  # 假设市值
-        df['price_volume_trend'] = df['close'] * df['vol']
-        
-        return df
-    
-    def create_labels(self, df):
-        """创建多任务标签"""
-        labels = {}
-        
-        # 价格预测标签（回归）
-        labels['price'] = df['close'].shift(-self.prediction_days)
-        
-        # 方向预测标签（分类）
-        future_return = df['close'].shift(-self.prediction_days) / df['close'] - 1
-        labels['direction'] = (future_return > 0).astype(int)
-        
-        # 幅度预测标签（分类）
-        labels['magnitude'] = pd.cut(future_return, 
-                                   bins=[-np.inf, -0.02, 0.02, np.inf], 
-                                   labels=[0, 1, 2])  # 0:下跌, 1:横盘, 2:上涨
-        
-        return labels
-    
-    def prepare_sequences(self, df, labels):
+    def prepare_data(self):
         """准备序列数据"""
-        # 选择特征列 - 排除日期、代码等非数值列
-        exclude_cols = ['date', 'code', 'tradingday', 'secucode', 'ts_code']  # 添加更多可能的非数值列名
-        feature_cols = [col for col in df.columns if col not in exclude_cols]
+        self.sequences = []
+        self.targets = []
         
-        # 进一步过滤：只保留数值类型的列
-        numeric_cols = []
-        for col in feature_cols:
-            if df[col].dtype in ['int64', 'float64', 'int32', 'float32']:
-                numeric_cols.append(col)
-            else:
-                print(f"跳过非数值列: {col} (类型: {df[col].dtype})")
+        # 按股票代码分组
+        for secucode in self.data['secucode'].unique():
+            stock_data = self.data[self.data['secucode'] == secucode].sort_values('tradingday')
+            
+            if len(stock_data) < self.sequence_length + 1:
+                continue
+                
+            # 获取特征数据
+            features = stock_data[self.feature_columns].values
+            
+            # 创建序列
+            for i in range(len(features) - self.sequence_length):
+                seq = features[i:i+self.sequence_length]
+                target = features[i+self.sequence_length][self.feature_columns.index(self.target_column)]
+                
+                self.sequences.append(seq)
+                self.targets.append(target)
         
-        self.feature_columns = numeric_cols
-        print(f"使用的特征列数量: {len(numeric_cols)}")
-        
-        # 只选择数值列
-        df_numeric = df[numeric_cols].copy()
-        
-        # 移除包含NaN的行
-        df_clean = df_numeric.dropna()
-        print(f"清理后的数据形状: {df_clean.shape}")
-        
-        # 对齐标签
-        for key in labels:
-            labels[key] = labels[key].loc[df_clean.index]
-        
-        # 标准化特征 - 现在只处理数值数据
-        features_scaled = self.feature_scaler.fit_transform(df_clean)
-        
-        # 创建序列
-        X, y_price, y_direction, y_magnitude = [], [], [], []
-        
-        for i in range(len(features_scaled) - self.seq_length - self.prediction_days + 1):
-            if not pd.isna(labels['price'].iloc[i + self.seq_length - 1]):
-                X.append(features_scaled[i:i + self.seq_length])
-                y_price.append(labels['price'].iloc[i + self.seq_length - 1])
-                y_direction.append(labels['direction'].iloc[i + self.seq_length - 1])
-                y_magnitude.append(labels['magnitude'].iloc[i + self.seq_length - 1])
-        
-        print(f"最终序列数量: {len(X)}")
-        return np.array(X), np.array(y_price), np.array(y_direction), np.array(y_magnitude)
-
-class ImprovedStockTransformer(nn.Module):
-    """改进的Transformer模型"""
+        self.sequences = np.array(self.sequences, dtype=np.float32)
+        self.targets = np.array(self.targets, dtype=np.float32)
     
-    def __init__(self, input_dim, d_model=128, nhead=8, num_layers=3, seq_len=30, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return torch.tensor(self.sequences[idx]), torch.tensor(self.targets[idx])
+
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+    def __init__(self, d_model, max_len=1000):
+        super(PositionalEncoding, self).__init__()
         
-        # 输入投影
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
+
+class TransformerStockPredictor(nn.Module):
+    """Transformer股票预测模型"""
+    def __init__(self, input_dim=6, d_model=128, nhead=8, num_layers=4, 
+                 dim_feedforward=512, sequence_length=30, dropout=0.1):
+        super(TransformerStockPredictor, self).__init__()
+        
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.sequence_length = sequence_length
+        
+        # 输入投影层
         self.input_projection = nn.Linear(input_dim, d_model)
         
         # 位置编码
-        self.pos_encoding = self.create_positional_encoding(seq_len, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, sequence_length)
         
         # Transformer编码器
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=d_model * 4,
+            dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation='gelu'
+            activation='relu'
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 多头输出
-        self.price_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+        # 输出层
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1)
-        )
-        
-        self.direction_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(dim_feedforward // 2, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 2)  # 上涨/下跌
+            nn.Linear(64, 1)
         )
         
-        self.magnitude_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 3)  # 下跌/横盘/上涨
-        )
+        self.dropout = nn.Dropout(dropout)
         
-        # 注意力池化
-        self.attention_pool = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        
-    def create_positional_encoding(self, seq_len, d_model):
-        """创建位置编码"""
-        pe = torch.zeros(seq_len, d_model)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0)
-    
     def forward(self, x):
-        batch_size = x.size(0)
+        # x shape: (batch_size, sequence_length, input_dim)
+        batch_size, seq_len, _ = x.shape
         
-        # 输入投影
-        x = self.input_projection(x)  # [batch, seq, d_model]
+        # 投影到模型维度
+        x = self.input_projection(x)  # (batch_size, sequence_length, d_model)
+        
+        # 转置以适应Transformer输入格式
+        x = x.transpose(0, 1)  # (sequence_length, batch_size, d_model)
         
         # 添加位置编码
-        x = x + self.pos_encoding[:, :x.size(1), :].to(x.device)
-        
-        # 添加CLS token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.positional_encoding(x)
+        x = self.dropout(x)
         
         # Transformer编码
-        x = x.transpose(0, 1)  # [seq+1, batch, d_model]
-        x = self.transformer(x)
+        transformer_output = self.transformer_encoder(x)
         
-        # 使用CLS token的输出
-        cls_output = x[0]  # [batch, d_model]
+        # 使用最后一个时间步的输出
+        last_output = transformer_output[-1]  # (batch_size, d_model)
         
-        # 多头输出
-        price_output = self.price_head(cls_output)
-        direction_output = self.direction_head(cls_output)
-        magnitude_output = self.magnitude_head(cls_output)
+        # 预测输出
+        output = self.output_projection(last_output)
         
-        return price_output, direction_output, magnitude_output
+        return output.squeeze(-1)
 
-class MultiTaskLoss(nn.Module):
-    """多任务损失函数"""
-    
-    def __init__(self, alpha=1.0, beta=1.0, gamma=1.0):
-        super().__init__()
-        self.alpha = alpha  # 价格预测权重
-        self.beta = beta    # 方向预测权重
-        self.gamma = gamma  # 幅度预测权重
+class StockPredictor:
+    """股票预测器主类"""
+    def __init__(self, data_dir='data', model_save_dir='models', results_dir='results'):
+        self.data_dir = data_dir
+        self.model_save_dir = model_save_dir
+        self.results_dir = results_dir
         
-        self.mse_loss = nn.MSELoss()
-        self.ce_loss = nn.CrossEntropyLoss()
+        # 创建目录
+        os.makedirs(self.model_save_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
         
-    def forward(self, price_pred, direction_pred, magnitude_pred, 
-                price_true, direction_true, magnitude_true):
-        
-        # 价格预测损失
-        price_loss = self.mse_loss(price_pred.squeeze(), price_true)
-        
-        # 方向预测损失
-        direction_loss = self.ce_loss(direction_pred, direction_true.long())
-        
-        # 幅度预测损失（处理可能的NaN）
-        valid_mask = ~torch.isnan(magnitude_true)
-        if valid_mask.sum() > 0:
-            magnitude_loss = self.ce_loss(magnitude_pred[valid_mask], magnitude_true[valid_mask].long())
-        else:
-            magnitude_loss = torch.tensor(0.0, device=price_pred.device)
-        
-        # 总损失
-        total_loss = self.alpha * price_loss + self.beta * direction_loss + self.gamma * magnitude_loss
-        
-        return total_loss, price_loss, direction_loss, magnitude_loss
-
-class ImprovedStockTrainer:
-    """改进的股票训练器"""
-    
-    def __init__(self, config):
-        self.config = config
+        # 设备选择
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.processor = ImprovedStockDataProcessor(
-            seq_length=config['seq_length'],
-            prediction_days=config['prediction_days']
-        )
+        print(f"使用设备: {self.device}")
         
-    def train_model(self, train_data):
-        """训练模型"""
-        print("🚀 开始改进版模型训练...")
+        # 数据标准化器
+        self.scaler = StandardScaler()
+        
+        # 训练历史
+        self.train_history = {'loss': [], 'val_loss': [], 'epoch': []}
+        
+    def load_data(self):
+        """加载训练数据"""
+        print("加载训练数据...")
+        train_data_dir = os.path.join(self.data_dir, 'learn_csv')
+        if not os.path.exists(train_data_dir):
+            print(f"❌ 训练数据目录不存在: {train_data_dir}")
+            print("已自动创建该目录，请将训练用csv文件放入此目录后重新运行。")
+            os.makedirs(train_data_dir, exist_ok=True)
+            raise FileNotFoundError(f"训练数据目录不存在: {train_data_dir}")
+        all_data = []
+        
+        csv_files = [f for f in os.listdir(train_data_dir) if f.endswith('.csv')]
+        csv_files.sort()
+        
+        for file in tqdm(csv_files, desc="加载CSV文件"):
+            file_path = os.path.join(train_data_dir, file)
+            try:
+                df = pd.read_csv(file_path)
+                if not df.empty:
+                    all_data.append(df)
+            except Exception as e:
+                print(f"加载文件 {file} 时出错: {e}")
+        
+        if not all_data:
+            raise ValueError("未找到有效的训练数据文件")
+        
+        # 合并所有数据
+        combined_data = pd.concat(all_data, ignore_index=True)
         
         # 数据预处理
-        print("📊 数据预处理...")
-        train_data = self.processor.add_advanced_features(train_data)
-        labels = self.processor.create_labels(train_data)
-        X, y_price, y_direction, y_magnitude = self.processor.prepare_sequences(train_data, labels)
+        combined_data = self.preprocess_data(combined_data)
         
-        print(f"✅ 数据准备完成: {X.shape[0]} 个样本")
-        print(f"   特征维度: {X.shape[2]}")
-        print(f"   序列长度: {X.shape[1]}")
+        print(f"加载完成，总计 {len(combined_data)} 条记录")
+        return combined_data
+    
+    def preprocess_data(self, data):
+        """数据预处理"""
+        print("数据预处理...")
         
-        # 数据划分
-        split_idx = int(0.8 * len(X))
-        X_train, X_val = X[:split_idx], X[split_idx:]
-        y_price_train, y_price_val = y_price[:split_idx], y_price[split_idx:]
-        y_direction_train, y_direction_val = y_direction[:split_idx], y_direction[split_idx:]
-        y_magnitude_train, y_magnitude_val = y_magnitude[:split_idx], y_magnitude[split_idx:]
+        # 确保数据类型正确
+        numeric_columns = ['preclose', 'open', 'high', 'low', 'close', 'vol', 'amount']
+        for col in numeric_columns:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+        
+        # 移除缺失值
+        data = data.dropna()
+        
+        # 移除异常值（价格为0或负数的记录）
+        price_columns = ['preclose', 'open', 'high', 'low', 'close']
+        for col in price_columns:
+            if col in data.columns:
+                data = data[data[col] > 0]
+        
+        # 计算技术指标
+        data = self.calculate_technical_indicators(data)
+        
+        return data
+    
+    def calculate_technical_indicators(self, data):
+        """计算技术指标"""
+        print("计算技术指标...")
+        
+        # 按股票代码分组计算指标
+        for secucode in data['secucode'].unique():
+            mask = data['secucode'] == secucode
+            stock_data = data[mask].sort_values('tradingday')
+            
+            if len(stock_data) < 20:  # 至少需要20天数据
+                continue
+            
+            # 计算收益率
+            stock_data['returns'] = stock_data['close'].pct_change()
+            
+            # 计算移动平均线
+            stock_data['ma_5'] = stock_data['close'].rolling(window=5).mean()
+            stock_data['ma_10'] = stock_data['close'].rolling(window=10).mean()
+            stock_data['ma_20'] = stock_data['close'].rolling(window=20).mean()
+            
+            # 计算RSI
+            delta = stock_data['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            stock_data['rsi'] = 100 - (100 / (1 + rs))
+            
+            # 计算MACD
+            exp1 = stock_data['close'].ewm(span=12).mean()
+            exp2 = stock_data['close'].ewm(span=26).mean()
+            stock_data['macd'] = exp1 - exp2
+            stock_data['macd_signal'] = stock_data['macd'].ewm(span=9).mean()
+            
+            # 更新原数据
+            data.loc[mask, stock_data.columns] = stock_data
+        
+        return data
+    
+    def prepare_datasets(self, data, sequence_length=30, train_split=0.8):
+        """准备训练和验证数据集"""
+        print("准备数据集...")
+        
+        # 按时间排序
+        data = data.sort_values('tradingday')
+        
+        # 分割训练和验证数据
+        split_idx = int(len(data) * train_split)
+        train_data = data.iloc[:split_idx]
+        val_data = data.iloc[split_idx:]
+        
+        # 标准化数据
+        feature_columns = ['open', 'high', 'low', 'close', 'vol', 'amount']
+        train_features = train_data[feature_columns].values
+        val_features = val_data[feature_columns].values
+        
+        # 拟合标准化器
+        self.scaler.fit(train_features)
+        
+        # 标准化
+        train_data_scaled = train_data.copy()
+        val_data_scaled = val_data.copy()
+        
+        train_data_scaled[feature_columns] = self.scaler.transform(train_features)
+        val_data_scaled[feature_columns] = self.scaler.transform(val_features)
+        
+        # 创建数据集
+        train_dataset = StockDataset(train_data_scaled, sequence_length)
+        val_dataset = StockDataset(val_data_scaled, sequence_length)
+        
+        print(f"训练集大小: {len(train_dataset)}")
+        print(f"验证集大小: {len(val_dataset)}")
+        
+        return train_dataset, val_dataset
+    
+    def train_model(self, train_dataset, val_dataset, epochs=100, batch_size=128, 
+                   learning_rate=0.001, patience=20):
+        """训练模型"""
+        print("开始训练模型...")
         
         # 创建数据加载器
-        train_dataset = TensorDataset(
-            torch.FloatTensor(X_train),
-            torch.FloatTensor(y_price_train),
-            torch.LongTensor(y_direction_train),
-            torch.LongTensor(y_magnitude_train)
-        )
-        
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=self.config['batch_size'],
-            shuffle=True,
-            pin_memory=True
-        )
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         
         # 创建模型
-        model = ImprovedStockTransformer(
-            input_dim=X.shape[2],
-            d_model=self.config['d_model'],
-            nhead=self.config['nhead'],
-            num_layers=self.config['num_layers'],
-            seq_len=self.config['seq_length'],
-            dropout=self.config['dropout']
+        model = TransformerStockPredictor(
+            input_dim=6,
+            d_model=128,
+            nhead=8,
+            num_layers=4,
+            dim_feedforward=512,
+            sequence_length=30,
+            dropout=0.1
         ).to(self.device)
         
         # 损失函数和优化器
-        criterion = MultiTaskLoss(alpha=1.0, beta=2.0, gamma=1.0)  # 强调方向预测
-        optimizer = optim.AdamW(
-            model.parameters(), 
-            lr=self.config['learning_rate'],
-            weight_decay=self.config['weight_decay']
-        )
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
+                                                       factor=0.5, patience=10)
         
-        # 学习率调度器
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer, 
-            max_lr=self.config['learning_rate'],
-            steps_per_epoch=len(train_loader),
-            epochs=self.config['epochs'],
-            pct_start=0.3
-        )
+        # 早停机制
+        best_val_loss = float('inf')
+        patience_counter = 0
         
-        # 训练循环
-        train_losses = []
-        val_accuracies = []
-        best_val_acc = 0
+        print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         
-        # ===== 修复模型保存路径 =====
-        model_save_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models'))
-        os.makedirs(model_save_dir, exist_ok=True)
-        best_model_path = os.path.join(model_save_dir, 'best_improved_model.pth')
-        best_config_path = os.path.join(model_save_dir, 'best_improved_model_config.pkl')
-        best_processor_path = os.path.join(model_save_dir, 'best_improved_model_processor.pkl')
-        print(f"🛠️ 模型保存目录: {model_save_dir}")
-        if not os.path.exists(model_save_dir):
-            print(f"❌ 无法创建目录: {model_save_dir}")
-            return
-        print(f"💾 模型将保存到: {best_model_path}")
-        print(f"📝 配置将保存到: {best_config_path}")
-        print(f"🔧 处理器将保存到: {best_processor_path}")
-        # ===== 修复结束 =====
-        
-        for epoch in range(self.config['epochs']):
+        for epoch in range(epochs):
             # 训练阶段
             model.train()
-            epoch_losses = []
+            train_loss = 0.0
             
-            for batch_X, batch_y_price, batch_y_direction, batch_y_magnitude in train_loader:
-                batch_X = batch_X.to(self.device)
-                batch_y_price = batch_y_price.to(self.device)
-                batch_y_direction = batch_y_direction.to(self.device)
-                batch_y_magnitude = batch_y_magnitude.to(self.device)
+            for batch_idx, (sequences, targets) in enumerate(tqdm(train_loader, 
+                                                                 desc=f"Epoch {epoch+1}/{epochs}")):
+                sequences, targets = sequences.to(self.device), targets.to(self.device)
                 
                 optimizer.zero_grad()
+                outputs = model(sequences)
+                loss = criterion(outputs, targets)
+                loss.backward()
                 
-                price_pred, direction_pred, magnitude_pred = model(batch_X)
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
-                total_loss, price_loss, direction_loss, magnitude_loss = criterion(
-                    price_pred, direction_pred, magnitude_pred,
-                    batch_y_price, batch_y_direction, batch_y_magnitude
-                )
-                
-                total_loss.backward()
                 optimizer.step()
-                scheduler.step()
-                
-                epoch_losses.append(total_loss.item())
+                train_loss += loss.item()
             
             # 验证阶段
             model.eval()
-            val_predictions = []
-            val_targets = []
+            val_loss = 0.0
             
             with torch.no_grad():
-                val_X = torch.FloatTensor(X_val).to(self.device)
-                val_y_direction = torch.LongTensor(y_direction_val).to(self.device)
+                for sequences, targets in val_loader:
+                    sequences, targets = sequences.to(self.device), targets.to(self.device)
+                    outputs = model(sequences)
+                    loss = criterion(outputs, targets)
+                    val_loss += loss.item()
+            
+            # 计算平均损失
+            avg_train_loss = train_loss / len(train_loader)
+            avg_val_loss = val_loss / len(val_loader)
+            
+            # 更新学习率
+            scheduler.step(avg_val_loss)
+            
+            # 记录训练历史
+            self.train_history['loss'].append(avg_train_loss)
+            self.train_history['val_loss'].append(avg_val_loss)
+            self.train_history['epoch'].append(epoch + 1)
+            
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"训练损失: {avg_train_loss:.6f}, 验证损失: {avg_val_loss:.6f}")
+            print(f"当前学习率: {optimizer.param_groups[0]['lr']:.8f}")
+            
+            # 早停检查
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
                 
-                # 批量预测以节省内存
-                batch_size = self.config['batch_size']
-                for i in range(0, len(val_X), batch_size):
-                    batch_val_X = val_X[i:i+batch_size]
-                    _, direction_pred, _ = model(batch_val_X)
-                    val_predictions.extend(direction_pred.argmax(dim=1).cpu().numpy())
-                    val_targets.extend(val_y_direction[i:i+batch_size].cpu().numpy())
-            
-            # 计算验证准确率
-            val_acc = accuracy_score(val_targets, val_predictions)
-            val_accuracies.append(val_acc)
-            
-            # 保存最佳模型
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                try:
-                    torch.save(model.state_dict(), best_model_path)
-                    print(f"💾 保存最佳模型 (准确率: {val_acc:.4f})")
-                except Exception as e:
-                    print(f"❌ 保存模型时出错: {e}")
-            
-            # 打印进度
-            avg_loss = np.mean(epoch_losses)
-            train_losses.append(avg_loss)
-            
-            print(f'Epoch [{epoch+1}/{self.config["epochs"]}]')
-            print(f'  Loss: {avg_loss:.4f}')
-            print(f'  Val Accuracy: {val_acc:.4f}')
-            print(f'  Best Val Accuracy: {best_val_acc:.4f}')
-            print(f'  LR: {scheduler.get_last_lr()[0]:.6f}')
-            print('-' * 50)
-        
-        # 加载最佳模型
-        if os.path.exists(best_model_path):
-            model.load_state_dict(torch.load(best_model_path))
-            print("✅ 已加载最佳模型")
-        else:
-            print("⚠️ 未找到保存的最佳模型，使用最终模型")
-        
-        # 最终评估
-        self.evaluate_model(model, X_val, y_price_val, y_direction_val, y_magnitude_val)
-        
-        # 训练完成后强制保存一次最终模型和配置
-        try:
-            # 保存模型
-            torch.save(model.state_dict(), best_model_path)
-            
-            # 保存配置
-            with open(best_config_path, 'wb') as f:
-                pickle.dump(self.config, f)
+                # 保存最佳模型
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'loss': best_val_loss,
+                    'scaler': self.scaler
+                }, os.path.join(self.model_save_dir, 'best_enhanced_model.pth'))
                 
-            # 保存处理器
-            with open(best_processor_path, 'wb') as f:
-                pickle.dump(self.processor, f)
+                print(f"保存最佳模型 (验证损失: {best_val_loss:.6f})")
+            else:
+                patience_counter += 1
                 
-            print(f"💾 最终模型和配置已保存到 {model_save_dir} 目录")
-        except Exception as e:
-            print(f"❌ 保存最终模型时出错: {e}")
+            if patience_counter >= patience:
+                print(f"早停触发，在第 {epoch+1} 轮停止训练")
+                break
+            
+            print("-" * 50)
         
+        print("训练完成!")
         return model
     
-    def evaluate_model(self, model, X_test, y_price_test, y_direction_test, y_magnitude_test):
+    def plot_training_history(self):
+        """绘制训练历史"""
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(self.train_history['epoch'], self.train_history['loss'], 
+                label='训练损失', color='blue')
+        plt.plot(self.train_history['epoch'], self.train_history['val_loss'], 
+                label='验证损失', color='red')
+        plt.title('训练和验证损失')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(self.train_history['epoch'], self.train_history['loss'], 
+                label='训练损失', color='blue')
+        plt.plot(self.train_history['epoch'], self.train_history['val_loss'], 
+                label='验证损失', color='red')
+        plt.title('训练和验证损失 (对数坐标)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.yscale('log')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.results_dir, 'training_history.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    def evaluate_model(self, model, test_dataset):
         """评估模型"""
+        print("评估模型...")
+        
+        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+        
         model.eval()
+        predictions = []
+        actual_values = []
         
         with torch.no_grad():
-            X_test_tensor = torch.FloatTensor(X_test).to(self.device)
-            
-            # 批量预测
-            price_predictions = []
-            direction_predictions = []
-            magnitude_predictions = []
-            
-            batch_size = self.config['batch_size']
-            for i in range(0, len(X_test_tensor), batch_size):
-                batch_X = X_test_tensor[i:i+batch_size]
-                price_pred, direction_pred, magnitude_pred = model(batch_X)
+            for sequences, targets in tqdm(test_loader, desc="评估中"):
+                sequences, targets = sequences.to(self.device), targets.to(self.device)
+                outputs = model(sequences)
                 
-                price_predictions.extend(price_pred.cpu().numpy().flatten())
-                direction_predictions.extend(direction_pred.argmax(dim=1).cpu().numpy())
-                magnitude_predictions.extend(magnitude_pred.argmax(dim=1).cpu().numpy())
+                predictions.extend(outputs.cpu().numpy())
+                actual_values.extend(targets.cpu().numpy())
+        
+        predictions = np.array(predictions)
+        actual_values = np.array(actual_values)
         
         # 计算评估指标
-        direction_acc = accuracy_score(y_direction_test, direction_predictions)
-        direction_precision = precision_score(y_direction_test, direction_predictions, average='weighted')
-        direction_recall = recall_score(y_direction_test, direction_predictions, average='weighted')
-        direction_f1 = f1_score(y_direction_test, direction_predictions, average='weighted')
+        mse = mean_squared_error(actual_values, predictions)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(actual_values, predictions)
+        r2 = r2_score(actual_values, predictions)
         
-        # 价格预测评估
-        price_mse = np.mean((y_price_test - price_predictions) ** 2)
-        price_mae = np.mean(np.abs(y_price_test - price_predictions))
+        # 计算方向准确率
+        actual_direction = np.sign(np.diff(actual_values))
+        pred_direction = np.sign(np.diff(predictions))
+        direction_accuracy = np.mean(actual_direction == pred_direction)
         
-        print("\n📊 模型评估结果:")
-        print("=" * 50)
-        print(f"🎯 方向预测准确率: {direction_acc:.4f}")
-        print(f"📈 方向预测精确率: {direction_precision:.4f}")
-        print(f"📊 方向预测召回率: {direction_recall:.4f}")
-        print(f"🎪 方向预测F1分数: {direction_f1:.4f}")
-        print(f"💰 价格预测MSE: {price_mse:.6f}")
-        print(f"💲 价格预测MAE: {price_mae:.6f}")
-        print("=" * 50)
+        print(f"评估结果:")
+        print(f"MSE: {mse:.6f}")
+        print(f"RMSE: {rmse:.6f}")
+        print(f"MAE: {mae:.6f}")
+        print(f"R²: {r2:.6f}")
+        print(f"方向准确率: {direction_accuracy:.4f}")
         
         return {
-            'direction_accuracy': direction_acc,
-            'direction_precision': direction_precision,
-            'direction_recall': direction_recall,
-            'direction_f1': direction_f1,
-            'price_mse': price_mse,
-            'price_mae': price_mae
+            'mse': mse,
+            'rmse': rmse,
+            'mae': mae,
+            'r2': r2,
+            'direction_accuracy': direction_accuracy,
+            'predictions': predictions,
+            'actual_values': actual_values
         }
+    
+    def save_training_config(self, config):
+        """保存训练配置"""
+        with open(os.path.join(self.results_dir, 'training_config.json'), 'w') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+    
+    def run_training(self):
+        """运行完整的训练流程"""
+        print("="*60)
+        print("股票预测模型训练开始")
+        print("="*60)
+        
+        try:
+            # 加载数据
+            data = self.load_data()
+            
+            # 准备数据集
+            train_dataset, val_dataset = self.prepare_datasets(data)
+            
+            # 训练配置
+            config = {
+                'sequence_length': 30,
+                'batch_size': 128,
+                'learning_rate': 0.001,
+                'epochs': 100,
+                'patience': 20,
+                'model_architecture': 'Transformer',
+                'input_features': ['open', 'high', 'low', 'close', 'vol', 'amount'],
+                'training_samples': len(train_dataset),
+                'validation_samples': len(val_dataset)
+            }
+            
+            # 保存配置
+            self.save_training_config(config)
+            
+            # 训练模型
+            model = self.train_model(
+                train_dataset, val_dataset,
+                epochs=config['epochs'],
+                batch_size=config['batch_size'],
+                learning_rate=config['learning_rate'],
+                patience=config['patience']
+            )
+            
+            # 绘制训练历史
+            self.plot_training_history()
+            
+            # 评估模型
+            eval_results = self.evaluate_model(model, val_dataset)
+            
+            # 保存评估结果
+            with open(os.path.join(self.results_dir, 'evaluation_results.json'), 'w') as f:
+                eval_results_save = {k: v for k, v in eval_results.items() 
+                                   if k not in ['predictions', 'actual_values']}
+                json.dump(eval_results_save, f, indent=2, ensure_ascii=False)
+            
+            print("="*60)
+            print("训练完成!")
+            print(f"最佳模型保存在: {os.path.join(self.model_save_dir, 'best_enhanced_model.pth')}")
+            print(f"训练历史图保存在: {os.path.join(self.results_dir, 'training_history.png')}")
+            print("="*60)
+            
+            return model, eval_results
+            
+        except Exception as e:
+            print(f"训练过程中发生错误: {e}")
+            raise
 
-# 使用示例和配置
-def main():
-    """主函数 - 使用改进的配置"""
-    
-    print("🎯 股票价格预测模型训练程序")
-    print("=" * 60)
-    
-    # 检查GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"当前使用设备: {device}")
-    
-    # 优化后的配置
-    config = {
-        # 输入序列参数
-        'seq_length': 120,           # 更长历史窗口（捕获更长依赖）
-        'prediction_days': 7,        # 支持多步预测
-        # 模型结构参数（核心调整）
-        'd_model': 512,              # 更大模型容量
-        'nhead': 8,                  # 注意力头数（512/8=64）
-        'num_layers': 8,             # 更深网络
-        'dropout': 0.2,              # 增加正则
-        # 训练参数（适配扩大后的模型）
-        'batch_size': 128,           # 更大批量
-        'learning_rate': 2e-4,       # 稍低学习率
-        'epochs': 300,               # 更长训练
-        'weight_decay': 5e-5,        # 适度L2正则
-    }
-    
-    print("📋 配置参数:")
-    for key, value in config.items():
-        print(f"   {key}: {value}")
-    print()
-    
-    # 创建训练器
-    print("🏗️  正在创建训练器...")
-    trainer = ImprovedStockTrainer(config)
-    trainer.device = device  # 强制训练器使用检测到的设备
-    print("✅ 训练器创建完成")
-    
-    # 加载训练数据
-    train_data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/learn_csv'))
-    print("训练数据目录绝对路径:", train_data_dir)
-    
-    if not os.path.exists(train_data_dir):
-        print(f"❌ 训练数据目录不存在: {train_data_dir}")
-        print("请确保数据已标准化并放在正确位置")
-        return
-    
-    # 获取所有CSV文件
-    csv_files = [f for f in os.listdir(train_data_dir) if f.endswith('.csv')]
-    if not csv_files:
-        print(f"❌ 在 {train_data_dir} 中没有找到CSV文件")
-        return
-    
-    print(f"📁 找到 {len(csv_files)} 个CSV文件")
-    
-    # 加载第一个文件作为示例（你可以修改为加载多个文件）
-    sample_file = csv_files[0]
-    sample_path = os.path.join(train_data_dir, sample_file)
-    print(f"📄 加载示例文件: {sample_file}")
-    
-    try:
-        # 加载数据
-        train_data = pd.read_csv(sample_path)
-        print(f"✅ 成功加载数据，形状: {train_data.shape}")
-        print(f"📊 数据列: {list(train_data.columns)}")
-        
-        # 检查必要的列
-        required_cols = ['tradingday', 'secucode', 'close', 'open', 'high', 'low', 'vol', 'amount']
-        missing_cols = [col for col in required_cols if col not in train_data.columns]
-        if missing_cols:
-            print(f"⚠️  缺少必要的列: {missing_cols}")
-            print("请确保数据包含必要的价格和交易信息")
-            return
-        
-        # 数据预处理
-        print("\n🔧 数据预处理...")
-        # 确保日期列格式正确
-        if 'tradingday' in train_data.columns:
-            train_data['tradingday'] = pd.to_datetime(train_data['tradingday'], format='%Y%m%d')
-            train_data = train_data.sort_values('tradingday')
-        
-        # 移除重复数据
-        train_data = train_data.drop_duplicates()
-        if train_data is None:
-            print("❌ train_data 为 None，可能是 drop_duplicates 用法错误。请检查是否使用了 inplace=True 并赋值。")
-            return
-        print(f"✅ 预处理完成，最终数据形状: {train_data.shape}")
-        
-        # 开始训练
-        print("\n🚀 开始模型训练...")
-        model = trainer.train_model(train_data)
-        
-        print("\n🎉 训练完成！")
-        print("=" * 60)
-        print(f"📁 模型保存在: models/best_improved_model.pth")
-        print("=" * 60)
-        
-    except Exception as e:
-        print(f"❌ 加载数据时出错: {str(e)}")
-        print("请检查数据格式和路径")
-        return
-
+# 主程序
 if __name__ == "__main__":
-    main()
+    # 创建预测器实例
+    predictor = StockPredictor()
+    
+    # 运行训练
+    model, results = predictor.run_training()
+    
+    print("训练流程完成!")
