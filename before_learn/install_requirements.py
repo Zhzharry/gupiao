@@ -59,7 +59,8 @@ required_packages = {
     "yfinance": "yfinance",
     "transformers": "transformers",
     "ta": "ta",  # 技术分析库
-    "seaborn": "seaborn"  # 可视化库
+    "seaborn": "seaborn",  # 可视化库
+    "tensorflow": "tensorflow"  # 深度学习库
 }
 
 def install_if_missing(module_name, pip_name):
