@@ -22,11 +22,16 @@ class PredictionConfig:
         self.model_path = "models2"                    # 训练好的模型路径
         self.results_path = "results3"                 # 结果保存路径
         self.second_path = "data/Adjustment_csv3/second"  # second路径（昨天信息）
+        self.actual_data_path = "data/Adjustment_csv3/first"  # 真实数据路径（用于对比）
         
         # 预测配置
         self.sequence_length = 100  # 与训练时保持一致
         self.prediction_days = 20   # 预测未来天数
         self.target_column = 'close'
+        
+        # 预测时间范围配置
+        self.prediction_start_date = "2023-01-01"  # 预测开始日期
+        self.prediction_end_date = "2023-06-30"    # 预测结束日期
         
         # 滚动预测配置
         self.rolling_window = 1     # 每次滚动的步长（1表示每次预测1天然后滚动）
@@ -284,7 +289,7 @@ def predict_single_step(model, scaler_X, scaler_y, sequences):
         return None, False, str(e)
 
 def rolling_prediction(stock_code, model, scaler_X, scaler_y, df):
-    """滚动预测函数"""
+    """滚动预测函数 - 预测指定时间范围的数据"""
     print(f"开始对股票 {stock_code} 进行滚动预测...")
     
     # 确保有足够的数据
@@ -292,22 +297,88 @@ def rolling_prediction(stock_code, model, scaler_X, scaler_y, df):
     if total_days < config.min_history_days + config.prediction_days:
         raise ValueError(f"数据不足：需要至少 {config.min_history_days + config.prediction_days} 天，实际 {total_days} 天")
     
-    # 计算预测的起始和结束位置
-    prediction_start_idx = config.min_history_days
-    prediction_end_idx = total_days - config.prediction_days + 1
+    # 获取日期列名
+    date_col = 'Date' if 'Date' in df.columns else '日期'
+    
+    # 转换日期格式
+    df[date_col] = pd.to_datetime(df[date_col])
+    
+    # 设置预测时间范围
+    prediction_start = pd.to_datetime(config.prediction_start_date)
+    prediction_end = pd.to_datetime(config.prediction_end_date)
+    
+    print(f"配置的预测时间范围: {prediction_start.date()} 到 {prediction_end.date()}")
+    print(f"数据时间范围: {df[date_col].min().date()} 到 {df[date_col].max().date()}")
+    
+    # 检查预测时间范围是否在数据时间范围内
+    data_start = df[date_col].min()
+    data_end = df[date_col].max()
+    
+    if prediction_start > data_end:
+        raise ValueError(f"预测开始时间 {prediction_start.date()} 超出数据时间范围 {data_end.date()}")
+    
+    if prediction_end < data_start:
+        raise ValueError(f"预测结束时间 {prediction_end.date()} 早于数据开始时间 {data_start.date()}")
+    
+    # 调整预测时间范围到数据可用范围内
+    actual_prediction_start = max(prediction_start, data_start)
+    actual_prediction_end = min(prediction_end, data_end)
+    
+    print(f"实际预测时间范围: {actual_prediction_start.date()} 到 {actual_prediction_end.date()}")
+    
+    # 找到预测开始日期在数据中的位置
+    start_mask = df[date_col] >= actual_prediction_start
+    if not start_mask.any():
+        raise ValueError(f"数据中没有找到 {actual_prediction_start.date()} 之后的数据")
+    
+    prediction_start_idx = df[start_mask].index[0]  # 使用第一个匹配的索引
+    
+    # 找到预测结束日期在数据中的位置
+    end_mask = df[date_col] <= actual_prediction_end
+    if not end_mask.any():
+        raise ValueError(f"数据中没有找到 {actual_prediction_end.date()} 之前的数据")
+    
+    prediction_end_idx = df[end_mask].index[-1]  # 使用最后一个匹配的索引
+    
+    # 确保索引顺序正确
+    if prediction_start_idx > prediction_end_idx:
+        raise ValueError(f"预测开始索引 {prediction_start_idx} 大于结束索引 {prediction_end_idx}")
+    
+    print(f"预测数据索引范围: {prediction_start_idx} 到 {prediction_end_idx}")
     
     predictions = []
     actuals = []
     dates = []
     prediction_errors = []
     
-    # 获取日期列名
-    date_col = 'Date' if 'Date' in df.columns else '日期'
+    # 滚动预测循环 - 从prediction_start_idx开始，到prediction_end_idx结束
+    current_idx = prediction_start_idx
     
-    # 滚动预测循环
-    for current_idx in range(prediction_start_idx, prediction_end_idx, config.rolling_window):
+    while current_idx <= prediction_end_idx:
         try:
-            # 创建当前预测的输入序列（使用当前时间点之前的数据）
+            # 确保有足够的历史数据用于创建序列
+            if current_idx < config.sequence_length:
+                print(f"跳过索引 {current_idx}：历史数据不足 (需要 {config.sequence_length} 条)")
+                current_idx += config.rolling_window
+                continue
+            
+            # 计算要预测的目标日期索引
+            target_idx = current_idx + config.prediction_days - 1
+            
+            # 检查目标日期是否超出数据范围
+            if target_idx >= len(df):
+                print(f"目标预测日期索引 {target_idx} 超出数据范围，停止预测")
+                break
+            
+            # 获取目标日期
+            target_date = df[date_col].iloc[target_idx]
+            
+            # 只预测在指定时间范围内的目标日期
+            if target_date > actual_prediction_end:
+                print(f"目标日期 {target_date.date()} 超出预测范围，停止预测")
+                break
+            
+            # 创建当前预测的输入序列（使用current_idx之前的数据）
             sequences, feature_names = create_prediction_sequences(
                 df, config.sequence_length, current_idx
             )
@@ -321,25 +392,22 @@ def rolling_prediction(stock_code, model, scaler_X, scaler_y, df):
                 print(f"预测失败 (索引 {current_idx}): {error_msg}")
                 prediction_errors.append({
                     'index': current_idx,
+                    'target_date': target_date,
                     'error': error_msg
                 })
+                current_idx += config.rolling_window
                 continue
             
-            # 获取实际值（预测未来第prediction_days天的价格）
-            actual_idx = current_idx + config.prediction_days - 1
-            if actual_idx >= len(df):
-                break
-                
-            actual_price = df[config.target_column].iloc[actual_idx]
-            actual_date = df[date_col].iloc[actual_idx]
+            # 获取实际价格
+            actual_price = df[config.target_column].iloc[target_idx]
             
             # 记录预测结果
             predictions.append(prediction)
             actuals.append(actual_price)
-            dates.append(actual_date)
+            dates.append(target_date)
             
             if len(predictions) % 10 == 0:  # 每10步打印一次进度
-                print(f"已完成 {len(predictions)} 步预测...")
+                print(f"已完成 {len(predictions)} 步预测，当前预测日期: {target_date.date()}")
                 
         except Exception as e:
             print(f"预测步骤出错 (索引 {current_idx}): {str(e)}")
@@ -347,9 +415,21 @@ def rolling_prediction(stock_code, model, scaler_X, scaler_y, df):
                 'index': current_idx,
                 'error': str(e)
             })
-            continue
+        
+        current_idx += config.rolling_window
     
     if not predictions:
+        print("详细诊断信息:")
+        print(f"  数据总行数: {len(df)}")  
+        print(f"  序列长度要求: {config.sequence_length}")
+        print(f"  预测天数: {config.prediction_days}")
+        print(f"  预测起始索引: {prediction_start_idx}")
+        print(f"  预测结束索引: {prediction_end_idx}")
+        print(f"  错误数量: {len(prediction_errors)}")
+        if prediction_errors:
+            print("  前几个错误:")
+            for i, error in enumerate(prediction_errors[:3]):
+                print(f"    {i+1}. {error}")
         raise ValueError("没有成功的预测结果")
     
     print(f"股票 {stock_code} 滚动预测完成，共 {len(predictions)} 个预测点")
@@ -361,6 +441,8 @@ def rolling_prediction(stock_code, model, scaler_X, scaler_y, df):
         'errors': prediction_errors,
         'total_steps': len(predictions)
     }
+
+
 
 def calculate_rolling_metrics(predictions, actuals):
     """计算滚动预测的评估指标"""
@@ -383,6 +465,45 @@ def calculate_rolling_metrics(predictions, actuals):
         direction_accuracy = np.mean(actual_direction == pred_direction) * 100 if len(actual_direction) > 0 else 0
     else:
         direction_accuracy = 0
+    
+    # 涨跌二分类任务
+    if len(actuals) > 1:
+        # 计算实际涨跌
+        actual_changes = np.diff(actuals)
+        actual_up_down = actual_changes > 0  # True表示上涨，False表示下跌
+        
+        # 计算预测涨跌
+        pred_changes = np.diff(predictions)
+        pred_up_down = pred_changes > 0  # True表示预测上涨，False表示预测下跌
+        
+        # 计算涨跌分类准确率
+        up_down_accuracy = np.mean(actual_up_down == pred_up_down) * 100
+        
+        # 计算上涨预测准确率
+        actual_up_days = np.sum(actual_up_down)
+        if actual_up_days > 0:
+            up_pred_accuracy = np.sum((actual_up_down) & (pred_up_down)) / actual_up_days * 100
+        else:
+            up_pred_accuracy = 0
+        
+        # 计算下跌预测准确率
+        actual_down_days = np.sum(~actual_up_down)
+        if actual_down_days > 0:
+            down_pred_accuracy = np.sum((~actual_up_down) & (~pred_up_down)) / actual_down_days * 100
+        else:
+            down_pred_accuracy = 0
+        
+        # 统计涨跌分布
+        total_days = len(actual_up_down)
+        actual_up_ratio = np.sum(actual_up_down) / total_days * 100
+        pred_up_ratio = np.sum(pred_up_down) / total_days * 100
+        
+    else:
+        up_down_accuracy = 0
+        up_pred_accuracy = 0
+        down_pred_accuracy = 0
+        actual_up_ratio = 0
+        pred_up_ratio = 0
     
     # 累计收益率比较
     actual_returns = (actuals[-1] - actuals[0]) / actuals[0] * 100 if len(actuals) > 0 else 0
@@ -407,6 +528,11 @@ def calculate_rolling_metrics(predictions, actuals):
         'R2': r2,
         'MAPE': mape,
         'Direction_Accuracy': direction_accuracy,
+        'Up_Down_Accuracy': up_down_accuracy,
+        'Up_Prediction_Accuracy': up_pred_accuracy,
+        'Down_Prediction_Accuracy': down_pred_accuracy,
+        'Actual_Up_Ratio': actual_up_ratio,
+        'Predicted_Up_Ratio': pred_up_ratio,
         'Actual_Returns': actual_returns,
         'Predicted_Returns': pred_returns,
         'Trend_Consistency': trend_consistency,
@@ -429,55 +555,132 @@ def save_rolling_results(stock_code, sector, results, metrics):
         'Sector': sector
     })
     
+    # 添加涨跌信息
+    if len(result_df) > 1:
+        # 计算实际涨跌
+        actual_changes = np.diff(result_df['Actual_Price'])
+        actual_up_down = np.concatenate([[np.nan], actual_changes > 0])  # 第一天设为NaN
+        
+        # 计算预测涨跌
+        pred_changes = np.diff(result_df['Predicted_Price'])
+        pred_up_down = np.concatenate([[np.nan], pred_changes > 0])  # 第一天设为NaN
+        
+        # 添加涨跌列
+        result_df['Actual_Up_Down'] = actual_up_down
+        result_df['Predicted_Up_Down'] = pred_up_down
+        result_df['Up_Down_Correct'] = (actual_up_down == pred_up_down) & (~np.isnan(actual_up_down))
+        
+        # 添加涨跌标签
+        result_df['Actual_Direction'] = result_df['Actual_Up_Down'].map({True: 'Up', False: 'Down'})
+        result_df['Predicted_Direction'] = result_df['Predicted_Up_Down'].map({True: 'Up', False: 'Down'})
+    
     # 添加移动平均误差（平滑误差趋势）
     result_df['MA5_Error'] = result_df['Absolute_Error'].rolling(window=5).mean()
     result_df['MA10_Error'] = result_df['Absolute_Error'].rolling(window=10).mean()
     
+    # 添加预测时间范围信息
+    result_df['Prediction_Period'] = f"{config.prediction_start_date} to {config.prediction_end_date}"
+    
     # 保存详细结果
-    result_file = os.path.join(config.results_path, f"{stock_code}_rolling_prediction.csv")
+    result_file = os.path.join(config.results_path, f"{stock_code}_prediction_results.csv")
     result_df.to_csv(result_file, index=False, encoding='utf-8')
     
     # 创建指标摘要
     metrics_df = pd.DataFrame([metrics])
     metrics_df['Stock_Code'] = stock_code
     metrics_df['Sector'] = sector
+    metrics_df['Prediction_Period'] = f"{config.prediction_start_date} to {config.prediction_end_date}"
     
     return result_df, metrics_df
 
 def plot_rolling_prediction(stock_code, result_df, save_plot=True):
     """绘制滚动预测结果图表"""
     try:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 12))
         
-        # 上图：价格预测对比
-        ax1.plot(range(len(result_df)), result_df['Actual_Price'], 
-                label='实际价格', color='blue', linewidth=2)
-        ax1.plot(range(len(result_df)), result_df['Predicted_Price'], 
-                label='预测价格', color='red', linewidth=2, alpha=0.8)
-        ax1.set_title(f'{stock_code} 滚动预测结果对比')
-        ax1.set_xlabel('预测步数')
-        ax1.set_ylabel('价格')
+        # 转换日期格式，确保正确显示
+        dates = pd.to_datetime(result_df['Date'])
+        
+        # 左上：价格预测对比
+        ax1.plot(dates, result_df['Actual_Price'], 
+                label='Actual Price', color='blue', linewidth=2, marker='o', markersize=4)
+        ax1.plot(dates, result_df['Predicted_Price'], 
+                label='Predicted Price', color='red', linewidth=2, alpha=0.8, marker='s', markersize=4)
+        ax1.set_title(f'{stock_code} Price Prediction Comparison (2023-01-01 to 2023-06-30)')
+        ax1.set_xlabel('Date')
+        ax1.set_ylabel('Price')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
+        ax1.tick_params(axis='x', rotation=45)
         
-        # 下图：预测误差
-        ax2.plot(range(len(result_df)), result_df['Absolute_Error'], 
-                label='绝对误差', color='orange', alpha=0.7)
+        # 设置x轴日期格式
+        ax1.xaxis.set_major_locator(plt.matplotlib.dates.MonthLocator())
+        ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m'))
+        
+        # 右上：预测误差
+        ax2.plot(dates, result_df['Absolute_Error'], 
+                label='Absolute Error', color='orange', alpha=0.7, marker='o', markersize=3)
         if 'MA5_Error' in result_df.columns:
-            ax2.plot(range(len(result_df)), result_df['MA5_Error'], 
-                    label='5日平均误差', color='green', linewidth=2)
-        ax2.set_title(f'{stock_code} 预测误差变化')
-        ax2.set_xlabel('预测步数')
-        ax2.set_ylabel('绝对误差')
+            ax2.plot(dates, result_df['MA5_Error'], 
+                    label='5-Day MA Error', color='green', linewidth=2)
+        ax2.set_title(f'{stock_code} Prediction Error Trend')
+        ax2.set_xlabel('Date')
+        ax2.set_ylabel('Absolute Error')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis='x', rotation=45)
+        ax2.xaxis.set_major_locator(plt.matplotlib.dates.MonthLocator())
+        ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m'))
+        
+        # 左下：涨跌预测准确率
+        if 'Up_Down_Correct' in result_df.columns:
+            # 计算累计准确率
+            cumulative_accuracy = result_df['Up_Down_Correct'].cumsum() / range(1, len(result_df) + 1) * 100
+            
+            ax3.plot(dates, cumulative_accuracy, 
+                    label='Cumulative Up/Down Accuracy', color='purple', linewidth=2, marker='o', markersize=3)
+            ax3.axhline(y=50, color='black', linestyle='--', alpha=0.5, label='Random Guess (50%)')
+            ax3.set_title(f'{stock_code} Up/Down Prediction Accuracy')
+            ax3.set_xlabel('Date')
+            ax3.set_ylabel('Cumulative Accuracy (%)')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            ax3.tick_params(axis='x', rotation=45)
+            ax3.xaxis.set_major_locator(plt.matplotlib.dates.MonthLocator())
+            ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m'))
+        else:
+            # 如果没有涨跌数据，显示百分比误差
+            ax3.plot(dates, result_df['Percentage_Error'], 
+                    label='Percentage Error', color='purple', alpha=0.7, marker='o', markersize=3)
+            ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+            ax3.set_title(f'{stock_code} Percentage Error')
+            ax3.set_xlabel('Date')
+            ax3.set_ylabel('Percentage Error (%)')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            ax3.tick_params(axis='x', rotation=45)
+            ax3.xaxis.set_major_locator(plt.matplotlib.dates.MonthLocator())
+            ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m'))
+        
+        # 右下：散点图 - 预测值 vs 实际值
+        ax4.scatter(result_df['Actual_Price'], result_df['Predicted_Price'], 
+                   alpha=0.6, color='green')
+        # 添加对角线
+        min_val = min(result_df['Actual_Price'].min(), result_df['Predicted_Price'].min())
+        max_val = max(result_df['Actual_Price'].max(), result_df['Predicted_Price'].max())
+        ax4.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction Line')
+        ax4.set_title(f'{stock_code} Predicted vs Actual Values')
+        ax4.set_xlabel('Actual Price')
+        ax4.set_ylabel('Predicted Price')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
         
         plt.tight_layout()
         
         if save_plot:
-            plot_file = os.path.join(config.results_path, f"{stock_code}_rolling_prediction.png")
+            plot_file = os.path.join(config.results_path, f"{stock_code}_prediction_analysis.png")
             plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-            print(f"预测图表已保存: {plot_file}")
+            print(f"预测分析图表已保存: {plot_file}")
         
         plt.close()
         
@@ -492,9 +695,11 @@ def main():
     print(f"  预测天数: {config.prediction_days}")
     print(f"  滚动窗口: {config.rolling_window}")
     print(f"  最小历史天数: {config.min_history_days}")
+    print(f"  预测时间范围: {config.prediction_start_date} 到 {config.prediction_end_date}")
     print(f"  测试数据路径: {config.test_data_path}")
     print(f"  模型路径: {config.model_path}")
     print(f"  结果保存路径: {config.results_path}")
+    print(f"  真实数据路径: {config.actual_data_path}")
     
     # 创建结果保存目录
     os.makedirs(config.results_path, exist_ok=True)
@@ -569,6 +774,9 @@ def main():
             print(f"  RMSE: {metrics['RMSE']:.4f}")
             print(f"  MAPE: {metrics['MAPE']:.2f}%")
             print(f"  方向准确率: {metrics['Direction_Accuracy']:.2f}%")
+            print(f"  涨跌分类准确率: {metrics['Up_Down_Accuracy']:.2f}%")
+            print(f"  上涨预测准确率: {metrics['Up_Prediction_Accuracy']:.2f}%")
+            print(f"  下跌预测准确率: {metrics['Down_Prediction_Accuracy']:.2f}%")
             print(f"  趋势一致性: {'是' if metrics['Trend_Consistency'] else '否'}")
             
         except Exception as e:
@@ -660,6 +868,7 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
     report_lines.append(f"  预测未来: {config.prediction_days} 天")
     report_lines.append(f"  滚动窗口: {config.rolling_window} 天")
     report_lines.append(f"  最小历史数据: {config.min_history_days} 天")
+    report_lines.append(f"  预测时间范围: {config.prediction_start_date} 到 {config.prediction_end_date}")
     report_lines.append("")
     report_lines.append(f"测试结果概览:")
     report_lines.append(f"  总测试股票数: {len(all_results)}")
@@ -674,7 +883,7 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
     # 整体模型性能
     report_lines.append("整体模型性能:")
     report_lines.append("-" * 40)
-    for metric in ['RMSE', 'MAE', 'R2', 'MAPE', 'Direction_Accuracy']:
+    for metric in ['RMSE', 'MAE', 'R2', 'MAPE', 'Direction_Accuracy', 'Up_Down_Accuracy']:
         mean_key = f'{metric}_mean'
         std_key = f'{metric}_std'
         median_key = f'{metric}_median'
@@ -683,6 +892,17 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
                 f"{metric:20s}: 均值={overall_metrics[mean_key]:8.4f} ± {overall_metrics[std_key]:8.4f}, "
                 f"中位数={overall_metrics[median_key]:8.4f}"
             )
+    
+    # 涨跌分类详细统计
+    if 'Up_Down_Accuracy_mean' in overall_metrics:
+        report_lines.append("")
+        report_lines.append("涨跌分类任务性能:")
+        report_lines.append("-" * 40)
+        up_down_metrics = ['Up_Down_Accuracy', 'Up_Prediction_Accuracy', 'Down_Prediction_Accuracy']
+        for metric in up_down_metrics:
+            mean_key = f'{metric}_mean'
+            if mean_key in overall_metrics:
+                report_lines.append(f"{metric:25s}: {overall_metrics[mean_key]:8.2f}%")
     
     report_lines.append(f"{'趋势一致性比例':20s}: {trend_consistency_rate:8.2f}%")
     report_lines.append("")
@@ -714,7 +934,7 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
         report_lines.append(f"  股票数量: {stats['Stock_Count']}")
         report_lines.append(f"  总预测步数: {stats.get('Total_Predictions', 0)}")
         
-        for metric in ['RMSE', 'MAE', 'R2', 'MAPE', 'Direction_Accuracy']:
+        for metric in ['RMSE', 'MAE', 'R2', 'MAPE', 'Direction_Accuracy', 'Up_Down_Accuracy']:
             mean_key = f'{metric}_mean'
             if mean_key in stats:
                 report_lines.append(f"  {metric:15s}: {stats[mean_key]:8.4f}")
@@ -737,6 +957,10 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
         # 方向准确率分析
         high_direction_accuracy = [r for r in successful_results if r.get('Direction_Accuracy', 0) >= 60]
         report_lines.append(f"方向准确率≥60%的股票数: {len(high_direction_accuracy)} ({len(high_direction_accuracy)/len(successful_results)*100:.1f}%)")
+        
+        # 涨跌分类准确率分析
+        high_up_down_accuracy = [r for r in successful_results if r.get('Up_Down_Accuracy', 0) >= 60]
+        report_lines.append(f"涨跌分类准确率≥60%的股票数: {len(high_up_down_accuracy)} ({len(high_up_down_accuracy)/len(successful_results)*100:.1f}%)")
         
         # 趋势一致性分析
         consistent_trend = [r for r in successful_results if r.get('Trend_Consistency', False)]
@@ -771,6 +995,19 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
         direction_grade = "较差"
         
     report_lines.append(f"基于方向准确率的评级: {direction_grade} (平均方向准确率: {avg_direction:.2f}%)")
+    
+    # 基于涨跌分类准确率的评级
+    avg_up_down = overall_metrics.get('Up_Down_Accuracy_mean', 0)
+    if avg_up_down >= 60:
+        up_down_grade = "优秀"
+    elif avg_up_down >= 55:
+        up_down_grade = "良好"
+    elif avg_up_down >= 50:
+        up_down_grade = "一般"
+    else:
+        up_down_grade = "较差"
+        
+    report_lines.append(f"基于涨跌分类准确率的评级: {up_down_grade} (平均涨跌分类准确率: {avg_up_down:.2f}%)")
     report_lines.append("")
     
     # 改进建议
@@ -781,6 +1018,8 @@ def generate_rolling_evaluation_report(all_results, sector_performance, all_metr
         report_lines.append("• MAPE较高，建议优化特征工程或调整模型结构")
     if avg_direction < 55:
         report_lines.append("• 方向预测准确率偏低，建议增加趋势相关特征")
+    if avg_up_down < 55:
+        report_lines.append("• 涨跌分类准确率偏低，建议优化分类模型或增加技术指标")
     if trend_consistency_rate < 70:
         report_lines.append("• 长期趋势预测一致性不足，建议调整预测时间窗口")
     
